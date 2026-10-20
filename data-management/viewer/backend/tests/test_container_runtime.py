@@ -227,6 +227,60 @@ def test_dependency_installation_is_isolated_from_runtime_layers() -> None:
     assert "USER appuser" in runtime
 
 
+def test_given_installed_helper_when_imported_then_api_storage_and_models_remain_unloaded(tmp_path: Path) -> None:
+    backend = Path(__file__).resolve().parents[1]
+    project = tmp_path / "project"
+    project.mkdir()
+    shutil.copyfile(backend / "pyproject.toml", project / "pyproject.toml")
+    shutil.copytree(backend / "src", project / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    wheels = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--offline", "--wheel", "--out-dir", str(wheels), str(project)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    installed = tmp_path / "installed"
+    restore = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(installed),
+            "--no-deps",
+            "--no-index",
+            str(next(wheels.glob("*.whl"))),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert restore.returncode == 0, restore.stderr
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+sys.path.append(sys.argv[2])
+import src.caller_auth_helper as helper
+assert Path(helper.__file__).is_relative_to(sys.argv[1])
+assert 'src.api.main' not in sys.modules
+assert not any(name.startswith(('src.api.storage', 'torch', 'transformers', 'evaluation', 'physical_ai_curation'))
+               for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-B", "-c", script, str(installed), sysconfig.get_path("purelib")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_judge_profiles_install_from_their_own_lock_without_checkout_imports() -> None:
     backend = Path(__file__).resolve().parents[1]
     dockerfile = (backend / "Dockerfile").read_text()

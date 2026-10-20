@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import sys
 import types
@@ -20,7 +19,13 @@ from src.api.auth import (
     reset_auth_provider,
     resolve_principal_context,
 )
-from tests.conftest import make_asgi_request
+from tests.conftest import (
+    NAMEID_CLAIM,
+    HostedCaller,
+    encode_bytes,
+    encode_principal,
+    make_asgi_request,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -60,20 +65,21 @@ class TestApiKeyProvider:
 
 class TestEasyAuthProvider:
     @pytest.mark.asyncio
-    async def test_decodes_principal(self):
+    async def test_decodes_principal(self, hosted_caller: HostedCaller) -> None:
         principal = {
             "claims": [
-                {"typ": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier", "val": "user-1"},
+                {"typ": NAMEID_CLAIM, "val": "user-1"},
                 {"typ": "name", "val": "Alice"},
                 {"typ": "roles", "val": "admin"},
                 {"typ": "roles", "val": "viewer"},
             ]
         }
-        encoded = base64.b64encode(json.dumps(principal).encode()).decode()
-        provider = EasyAuthProvider()
-        result = await provider.authenticate(
-            make_asgi_request("POST", "/api/x", headers={"X-MS-CLIENT-PRINCIPAL": encoded})
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal=encode_principal(principal))
         )
+
+        result = await hosted_caller.provider.authenticate(request)
+
         assert result == {
             "sub": "user-1",
             "name": "Alice",
@@ -82,34 +88,166 @@ class TestEasyAuthProvider:
         }
 
     @pytest.mark.asyncio
-    async def test_missing_principal_returns_none(self):
-        assert await EasyAuthProvider().authenticate(make_asgi_request("POST", "/api/x")) is None
+    async def test_missing_principal_returns_none(self, hosted_caller: HostedCaller) -> None:
+        request = make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(principal=None))
+        assert await hosted_caller.provider.authenticate(request) is None
 
     @pytest.mark.asyncio
-    async def test_invalid_base64_returns_none(self):
-        result = await EasyAuthProvider().authenticate(
-            make_asgi_request("POST", "/api/x", headers={"X-MS-CLIENT-PRINCIPAL": "not-valid-base64!!!"})
+    async def test_invalid_base64_returns_none(self, hosted_caller: HostedCaller) -> None:
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal="not-valid-base64!!!")
         )
-        assert result is None
+        assert await hosted_caller.provider.authenticate(request) is None
 
     @pytest.mark.asyncio
-    async def test_invalid_json_payload_returns_none(self):
-        encoded = base64.b64encode(b"not-json").decode()
-        result = await EasyAuthProvider().authenticate(
-            make_asgi_request("POST", "/api/x", headers={"X-MS-CLIENT-PRINCIPAL": encoded})
+    async def test_invalid_json_payload_returns_none(self, hosted_caller: HostedCaller) -> None:
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal=encode_bytes(b"not-json"))
         )
-        assert result is None
+        assert await hosted_caller.provider.authenticate(request) is None
 
     @pytest.mark.asyncio
-    async def test_missing_claims_yields_blank_identity(self):
-        encoded = base64.b64encode(json.dumps({}).encode()).decode()
-        result = await EasyAuthProvider().authenticate(
-            make_asgi_request("POST", "/api/x", headers={"X-MS-CLIENT-PRINCIPAL": encoded})
+    @pytest.mark.parametrize(
+        "principal",
+        [
+            {},
+            {"claims": []},
+            {"claims": [{"typ": "name", "val": "Alice"}]},
+            {"claims": [{"typ": NAMEID_CLAIM, "val": "   "}]},
+        ],
+        ids=["no-claims", "empty-claims", "no-subject", "blank-subject"],
+    )
+    async def test_blank_or_missing_subject_is_denied(self, hosted_caller: HostedCaller, principal: dict) -> None:
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal=encode_principal(principal))
         )
-        assert result == {"sub": "", "name": "", "roles": [], "auth_method": "easy_auth"}
+        assert await hosted_caller.provider.authenticate(request) is None
 
-    def test_www_authenticate_header(self):
-        assert EasyAuthProvider().www_authenticate == 'EasyAuth realm="DataViewer API"'
+    @pytest.mark.asyncio
+    async def test_missing_caller_proof_is_denied_before_principal(self, hosted_caller: HostedCaller) -> None:
+        request = make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(include_caller=False))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await hosted_caller.provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Caller authentication required"
+
+    def test_www_authenticate_header(self, hosted_caller: HostedCaller) -> None:
+        assert isinstance(hosted_caller.provider, EasyAuthProvider)
+        assert hosted_caller.provider.www_authenticate == 'EasyAuth realm="DataViewer API"'
+
+
+def _principal_with_decoded_size(size: int) -> str:
+    """Return a structurally valid principal whose decoded JSON is exactly ``size`` bytes."""
+    subject = {"typ": NAMEID_CLAIM, "val": "user-1"}
+    roles_count = 1
+    while True:
+        empty_roles = [{"typ": "roles", "val": ""}] * roles_count
+        base_size = len(json.dumps({"claims": [subject, *empty_roles]}).encode("utf-8"))
+        if size - base_size <= 2048 * roles_count:
+            break
+        roles_count += 1
+    remaining = size - base_size
+    lengths = []
+    for _ in range(roles_count):
+        take = min(remaining, 2048)
+        lengths.append(take)
+        remaining -= take
+    payload = {"claims": [subject, *({"typ": "roles", "val": "r" * length} for length in lengths)]}
+    decoded = json.dumps(payload).encode("utf-8")
+    assert len(decoded) == size
+    return encode_bytes(decoded)
+
+
+def _largest_padding_within(caller: HostedCaller, limit: int) -> int:
+    low, high = 0, limit
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(caller.token({"pad": "x" * middle})) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+class TestPrincipalBounds:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("size", "accepted"), [(6144, True), (6145, False)], ids=["at-limit", "over-limit"])
+    async def test_principal_size_limit(self, hosted_caller: HostedCaller, size: int, accepted: bool) -> None:
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal=_principal_with_decoded_size(size))
+        )
+
+        result = await hosted_caller.provider.authenticate(request)
+
+        assert (result is not None) is accepted
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("count", "accepted"), [(64, True), (65, False)], ids=["at-limit", "over-limit"])
+    async def test_claim_count_limit(self, hosted_caller: HostedCaller, count: int, accepted: bool) -> None:
+        claims = [{"typ": NAMEID_CLAIM, "val": "user-1"}, *({"typ": "roles", "val": "r"} for _ in range(count - 1))]
+        request = make_asgi_request(
+            "POST", "/api/x", headers=hosted_caller.request_headers(principal=encode_principal({"claims": claims}))
+        )
+
+        result = await hosted_caller.provider.authenticate(request)
+
+        assert (result is not None) is accepted
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("length", "accepted"), [(2048, True), (2049, False)], ids=["at-limit", "over-limit"])
+    async def test_claim_value_size_limit(self, hosted_caller: HostedCaller, length: int, accepted: bool) -> None:
+        principal = encode_principal({"claims": [{"typ": NAMEID_CLAIM, "val": "s" * length}]})
+        request = make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(principal=principal))
+
+        result = await hosted_caller.provider.authenticate(request)
+
+        assert (result is not None) is accepted
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("length", "accepted"), [(256, True), (257, False)], ids=["at-limit", "over-limit"])
+    async def test_claim_type_size_limit(self, hosted_caller: HostedCaller, length: int, accepted: bool) -> None:
+        principal = encode_principal(
+            {"claims": [{"typ": NAMEID_CLAIM, "val": "user-1"}, {"typ": "t" * length, "val": "x"}]}
+        )
+        request = make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(principal=principal))
+
+        result = await hosted_caller.provider.authenticate(request)
+
+        assert (result is not None) is accepted
+
+    @pytest.mark.asyncio
+    async def test_caller_token_size_limit(self, hosted_caller: HostedCaller) -> None:
+        limit = 8192
+        padding = _largest_padding_within(hosted_caller, limit)
+        within = hosted_caller.token({"pad": "x" * padding})
+        beyond = hosted_caller.token({"pad": "x" * (padding + 1)})
+        assert len(within) <= limit < len(beyond)
+
+        accepted = await hosted_caller.provider.authenticate(
+            make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(caller_token=within))
+        )
+        assert accepted is not None
+
+        with pytest.raises(HTTPException) as exc_info:
+            await hosted_caller.provider.authenticate(
+                make_asgi_request("POST", "/api/x", headers=hosted_caller.request_headers(caller_token=beyond))
+            )
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_caller_header_is_denied(self, hosted_caller: HostedCaller) -> None:
+        request = make_asgi_request(
+            "POST",
+            "/api/x",
+            headers=hosted_caller.request_headers(caller_token=f"{hosted_caller.token()}é"),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await hosted_caller.provider.authenticate(request)
+
+        assert exc_info.value.status_code == 401
 
 
 class TestJwtProvider:
@@ -239,10 +377,11 @@ class TestProviderSelection:
             await self._expect_challenge("ApiKey")
         assert "Unknown DATAVIEWER_AUTH_PROVIDER value: bogus; falling back to API-key" in caplog.messages
 
-    async def test_easy_auth_selection(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("DATAVIEWER_AUTH_DISABLED", "false")
-        monkeypatch.setenv("DATAVIEWER_AUTH_PROVIDER", "easy_auth")
-        await self._expect_challenge("EasyAuth")
+    async def test_easy_auth_selection(self, hosted_caller: HostedCaller) -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            await require_auth(make_asgi_request("POST", "/api/x"))
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "Caller authentication required"
 
     async def test_azure_ad_selection(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("DATAVIEWER_AUTH_DISABLED", "false")
