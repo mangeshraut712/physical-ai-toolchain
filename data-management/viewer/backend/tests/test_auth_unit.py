@@ -28,6 +28,18 @@ from tests.conftest import (
 )
 
 
+def _easy_auth_principal(*, subject: str = "user-1") -> str:
+    principal = {
+        "claims": [
+            {"typ": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier", "val": subject},
+            {"typ": "name", "val": "Alice"},
+            {"typ": "roles", "val": "admin"},
+            {"typ": "roles", "val": "viewer"},
+        ]
+    }
+    return encode_principal(principal)
+
+
 @pytest.fixture(autouse=True)
 def _reset_provider():
     reset_auth_provider()
@@ -367,15 +379,19 @@ class TestProviderSelection:
             await self._expect_challenge("ApiKey")
         assert "DATAVIEWER_API_KEY is not set; all API-key auth will fail" in caplog.messages
 
-    async def test_unknown_falls_back_to_apikey(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ):
+    async def test_unknown_provider_fails_closed(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("DATAVIEWER_AUTH_DISABLED", "false")
         monkeypatch.setenv("DATAVIEWER_AUTH_PROVIDER", "bogus")
         monkeypatch.setenv("DATAVIEWER_API_KEY", "k")
-        with caplog.at_level("ERROR", logger="src.api.auth"):
-            await self._expect_challenge("ApiKey")
-        assert "Unknown DATAVIEWER_AUTH_PROVIDER value: bogus; falling back to API-key" in caplog.messages
+        with pytest.raises(ValueError, match="DATAVIEWER_AUTH_PROVIDER"):
+            await require_auth(make_asgi_request("POST", "/api/x"))
+
+    async def test_easy_auth_selection_requires_caller_identity(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("DATAVIEWER_AUTH_DISABLED", "false")
+        monkeypatch.setenv("DATAVIEWER_AUTH_PROVIDER", "easy_auth")
+        monkeypatch.delenv("DATAVIEWER_CALLER_CLIENT_ID", raising=False)
+        with pytest.raises(ValueError, match="Hosted authentication"):
+            await require_auth(make_asgi_request("POST", "/api/x"))
 
     async def test_easy_auth_selection(self, hosted_caller: HostedCaller) -> None:
         with pytest.raises(HTTPException) as exc_info:
@@ -415,11 +431,27 @@ class TestRequireAuth:
         assert exc_info.value.detail == "Authentication required"
         assert exc_info.value.headers["WWW-Authenticate"] == 'ApiKey realm="DataViewer API"'
 
+    @pytest.mark.parametrize("proxy_key", [None, "wrong", "é"])
+    async def test_forged_easy_auth_header_is_rejected(
+        self,
+        hosted_caller: HostedCaller,
+        proxy_key: str | None,
+    ):
+        headers = {"X-MS-CLIENT-PRINCIPAL": _easy_auth_principal()}
+        if proxy_key is not None:
+            headers["X-Dataviewer-Proxy-Key"] = proxy_key
+
+        with pytest.raises(HTTPException) as exc_info:
+            await require_auth(make_asgi_request("POST", "/api/x", headers=headers))
+
+        assert exc_info.value.status_code == 401
+
     async def test_failure_logs_unknown_client_when_missing(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ):
+        # Build a request with no client tuple to exercise the "unknown" branch.
         from fastapi import FastAPI
         from starlette.requests import Request
 
@@ -467,9 +499,10 @@ class TestPrincipalContext:
 
     def test_given_different_providers_when_resolved_then_scopes_are_distinct(self):
         azure = resolve_principal_context({"sub": "shared-subject", "auth_method": "azure_ad"})
-        auth0 = resolve_principal_context({"sub": "shared-subject", "auth_method": "auth0"})
+        easy_auth = resolve_principal_context({"sub": "shared-subject", "auth_method": "easy_auth"})
 
-        assert azure.scope_id != auth0.scope_id
+        assert azure.scope_id != easy_auth.scope_id
+        assert easy_auth.auth_mode == "easy_auth"
 
     def test_given_disabled_auth_when_resolved_then_local_scope_is_non_personal(self):
         context = resolve_principal_context(None)

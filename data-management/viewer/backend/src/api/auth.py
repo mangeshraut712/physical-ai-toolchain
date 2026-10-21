@@ -381,8 +381,8 @@ def _build_provider() -> AuthProvider:
             )
         )
 
-    logger.error("Unknown DATAVIEWER_AUTH_PROVIDER value: %s; falling back to API-key", provider_name)
-    return ApiKeyProvider(os.environ.get("DATAVIEWER_API_KEY", ""))
+    logger.error("Unsupported DATAVIEWER_AUTH_PROVIDER value: %s", provider_name)
+    raise ValueError(f"Unsupported DATAVIEWER_AUTH_PROVIDER: {provider_name}")
 
 
 # Module-level singleton; reset in tests via ``reset_auth_provider()``.

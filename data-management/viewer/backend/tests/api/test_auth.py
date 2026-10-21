@@ -98,6 +98,30 @@ def client_auth_disabled(monkeypatch):
     ds_mod._dataset_service = None
 
 
+@pytest.fixture
+def client_with_easy_auth(hosted_caller: HostedCaller):
+    """Test client with signed frontend caller proof configured."""
+    import src.api.services.dataset_service as ds_mod
+
+    ds_mod._dataset_service = None
+    yield TestClient(app)
+    ds_mod._dataset_service = None
+
+
+def _easy_auth_headers(*, proxy_key: str | None = "proxy-secret") -> dict[str, str]:
+    principal = {
+        "claims": [
+            {"typ": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier", "val": "user-123"},
+            {"typ": "name", "val": "Test User"},
+            {"typ": "roles", "val": "Dataviewer.Admin"},
+        ]
+    }
+    headers = {"X-MS-CLIENT-PRINCIPAL": encode_principal(principal)}
+    if proxy_key is not None:
+        headers["X-Dataviewer-Proxy-Key"] = proxy_key
+    return headers
+
+
 # ============================================================================
 # CSRF token endpoint
 # ============================================================================
@@ -147,6 +171,22 @@ class TestPrincipalContextEndpoint:
 
     def test_missing_api_key_is_rejected(self, client_with_auth):
         response = client_with_auth.get("/api/auth/context")
+
+        assert response.status_code == 401
+
+    def test_proxy_bound_easy_auth_returns_opaque_user_scope(self, client_with_easy_auth, hosted_caller):
+        response = client_with_easy_auth.get("/api/auth/context", headers=hosted_caller.request_headers())
+
+        assert response.status_code == 200
+        assert response.json()["auth_mode"] == "easy_auth"
+        assert "user-123" not in response.json()["scope_id"]
+
+    @pytest.mark.parametrize("proxy_key", [None, "wrong"])
+    def test_unbound_easy_auth_principal_is_rejected(self, client_with_easy_auth, proxy_key):
+        response = client_with_easy_auth.get(
+            "/api/auth/context",
+            headers=_easy_auth_headers(proxy_key=proxy_key),
+        )
 
         assert response.status_code == 401
 
