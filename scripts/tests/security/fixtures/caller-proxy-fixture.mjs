@@ -8,13 +8,13 @@
 // JWT verification are covered by the backend and caller helper unit tests.
 //
 // Usage: node caller-proxy-fixture.mjs backend|helper
-// Shared state lives in /fixture: receipts record each request; helper-mode selects
-// the helper response (ok, empty, malformed, unavailable, slow).
+// Receipts stay in memory and are read through a container-loopback control endpoint.
+// /fixture/helper-mode selects the helper response (ok, empty, malformed, unavailable, slow).
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { generateKeyPairSync, sign } from 'node:crypto'
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createTlsServer } from 'node:https'
 import { request as httpRequest } from 'node:http'
@@ -30,9 +30,10 @@ const unsigned = [
 ].map((value) => Buffer.from(JSON.stringify(value)).toString('base64url')).join('.')
 const token = `${unsigned}.${sign('RSA-SHA256', Buffer.from(unsigned), privateKey).toString('base64url')}`
 const mediaBytes = Buffer.from('0123456789abcdef')
+const requestReceipts = []
 
-function record(file, entry) {
-  appendFileSync(`${fixture}/${file}`, `${JSON.stringify(entry)}\n`)
+function record(entry) {
+  requestReceipts.push(entry)
 }
 
 function readBody(request) {
@@ -46,7 +47,7 @@ function readBody(request) {
 function backendHandler(request, response) {
   readBody(request).then(async (body) => {
     const url = new URL(request.url, 'https://fixture')
-    record('backend-receipts.jsonl', {
+    record({
       method: request.method,
       url: request.url,
       headers: request.headers,
@@ -130,7 +131,7 @@ function helperMode() {
 
 function helperHandler(request, response) {
   readBody(request).then(async (body) => {
-    record('helper-receipts.jsonl', {
+    record({
       method: request.method,
       url: request.url,
       headers: request.headers,
@@ -180,8 +181,10 @@ async function runTransport() {
   let checks = 0
   const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
   const receipts = (kind) => {
-    try { return readFileSync(join(directory, `${kind}-receipts.jsonl`), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) }
-    catch { return [] }
+    const container = containers.find((name) => name.startsWith(`caller-${kind}-`))
+    if (!container) return []
+    return JSON.parse(docker('exec', container, 'node', '--input-type=module', '-e',
+      'const response = await fetch("http://127.0.0.1:8091/receipts"); if (!response.ok) throw new Error("Receipt lookup failed"); process.stdout.write(await response.text())'))
   }
   const check = (condition, message) => { assert.ok(condition, message); checks += 1 }
   const principal = Buffer.from(JSON.stringify({ claims: [{ typ: 'sub', val: 'user-1' }] })).toString('base64')
@@ -330,6 +333,7 @@ async function runTransport() {
         check(unhealthy.status >= 500 && Date.now() - start < 9000, 'storage health timeout is bounded')
       }
     }
+    check(!existsSync(join(directory, 'backend-receipts.jsonl')) && !existsSync(join(directory, 'helper-receipts.jsonl')), 'request receipts never persist to disk')
     for (const container of containers) {
       const logs = docker('logs', container)
       check(!logs.includes(token) && !logs.includes('incoming-one'), 'logs never contain caller proof')
@@ -342,6 +346,17 @@ async function runTransport() {
     try { docker('network', 'rm', network) } catch {}
     rmSync(directory, { recursive: true, force: true })
   }
+}
+
+if (role === 'backend' || role === 'helper') {
+  createHttpServer((request, response) => {
+    if (request.method !== 'GET' || request.url !== '/receipts') {
+      response.writeHead(404).end()
+      return
+    }
+    response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    response.end(JSON.stringify(requestReceipts))
+  }).listen(8091, '127.0.0.1')
 }
 
 if (role === 'run') {
