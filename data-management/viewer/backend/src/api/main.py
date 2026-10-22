@@ -208,8 +208,6 @@ async def validation_exception_handler(request, exc: RequestValidationError) -> 
 
 
 # Middleware stack (last added = outermost = first to execute)
-# Order: SecurityHeaders → ContentSizeLimit → CORS → FastAPI App
-app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(EpisodeCompressionMiddleware, minimum_size=1024, compresslevel=1)
 app.add_middleware(
     ContentSizeLimitMiddleware,
@@ -223,6 +221,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-API-Key", "X-Request-ID"],
 )
 app.add_middleware(HostedAuthMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 
 # All /api/* routes require authentication (health and csrf-token are on app directly)
 api_auth = [Depends(require_auth)]

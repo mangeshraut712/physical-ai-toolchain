@@ -490,6 +490,58 @@ def test_hosted_route_matrix_covers_bootstrap_docs_and_api() -> None:
     assert "/openapi.json" in covered
 
 
+@pytest.mark.parametrize("include_caller", [False, True])
+def test_given_hosted_denial_when_requesting_context_then_security_headers_remain(
+    hosted_client: TestClient, hosted_caller: HostedCaller, include_caller: bool
+) -> None:
+    response = hosted_client.get(
+        "/api/auth/context",
+        headers=hosted_caller.request_headers(include_caller=include_caller, principal=None),
+    )
+
+    assert response.status_code == 401
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["WWW-Authenticate"] == 'EasyAuth realm="DataViewer API"'
+
+
+@pytest.mark.parametrize("include_caller", [False, True])
+def test_given_hosted_preflight_when_authenticating_then_only_verified_user_reaches_cors(
+    hosted_client: TestClient, hosted_caller: HostedCaller, include_caller: bool
+) -> None:
+    from src.api.main import _config
+
+    origin = _config.cors_origins[0]
+    response = hosted_client.options(
+        "/api/datasets",
+        headers=hosted_caller.request_headers(
+            include_caller=include_caller,
+            extra=[("Origin", origin), ("Access-Control-Request-Method", "GET")],
+        ),
+    )
+
+    assert response.status_code == (200 if include_caller else 401)
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    if include_caller:
+        assert response.headers["Access-Control-Allow-Origin"] == origin
+
+
+@pytest.mark.asyncio
+async def test_given_empty_roles_when_authenticating_then_only_main_compatible_roles_remain(
+    hosted_caller: HostedCaller,
+) -> None:
+    principal = encode_principal(
+        {"claims": [SUBJECT_CLAIM, {"typ": "roles", "val": ""}, {"typ": "roles", "val": "Dataviewer.Admin"}]}
+    )
+
+    user = await hosted_caller.provider.authenticate(
+        make_asgi_request("GET", "/api/auth/context", headers=hosted_caller.request_headers(principal=principal))
+    )
+
+    assert user is not None
+    assert user["roles"] == ["Dataviewer.Admin"]
+
+
 def _caller_case(case_id: str, **options: Any) -> Any:
     return pytest.param(lambda caller: caller.request_headers(caller_token=caller.token(**options)), id=case_id)
 

@@ -254,7 +254,11 @@ class CallerVerifier:
         import jwt
 
         token = _single_header(request, CALLER_TOKEN_HEADER, MAX_CALLER_TOKEN_BYTES)
-        invalid = HTTPException(status_code=401, detail="Caller authentication required")
+        invalid = HTTPException(
+            status_code=401,
+            detail="Caller authentication required",
+            headers={"WWW-Authenticate": 'EasyAuth realm="DataViewer API"'},
+        )
         if token is None:
             raise invalid
         try:
@@ -325,7 +329,7 @@ class EasyAuthProvider(AuthProvider):
                 subjects.append(val)
             elif typ == "name":
                 name = val
-            elif typ == "roles":
+            elif typ == "roles" and val:
                 roles.append(val)
         if len(subjects) != 1 or not subjects[0].strip():
             return None
