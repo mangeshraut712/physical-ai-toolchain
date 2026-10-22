@@ -1,7 +1,7 @@
 ---
 title: Viewer Deployment
 description: Deployment, caller authentication and recovery contracts for the Dataset Analysis Tool
-ms.date: 2026-10-21
+ms.date: 2026-10-22
 ms.topic: reference
 ---
 
@@ -150,10 +150,11 @@ Assignment-required issuance needs an approved Application-role design; neither 
 
 Selected images must resolve to digests in the configured registry before app mutation. Complete named-container manifests reconcile images, entry points, arguments, environment, probes, resources and identity bindings despite Terraform's ignored templates. Credentials must use secret references, not inherited plaintext environment settings. Generated temporary manifests are private and removed after use; application-scoped secret objects are not copied or deleted.
 
-1. Close frontend ingress, configure and verify Easy Auth, then install the pending frontend/helper revision.
+1. Close frontend ingress, then configure and verify Easy Auth.
 2. Install the backend's token-only revision and verify all four caller UUIDs with auth enabled.
-3. Verify frontend Easy Auth and anonymous forged-principal denial before enabling managed-identity forwarding.
-4. Install the active frontend/helper revision, recheck auth and denial, then complete the interactive browser/media gate within 15 minutes.
+3. Install and verify the pending frontend/helper revision after the backend is ready.
+4. Verify frontend Easy Auth, reopen frontend ingress and check anonymous forged-principal denial before enabling managed-identity forwarding.
+5. Install the active frontend/helper revision, recheck auth and denial, then complete the interactive browser/media gate within 15 minutes.
 
 Each update must return a revision; that exact revision must become ready and match the desired named containers, commands, settings, resources, probes, mounts and identities. An earlier ready revision cannot mask failure. Initial shared-proof migration requires a controlled deny window; mixed versions are not promised uninterrupted traffic.
 
@@ -177,5 +178,13 @@ The Easy Auth login secret remains Terraform-owned and required. Old `dataviewer
 | Compose on an Azure host with Blob | Existing non-hosted application mode; storage credentials remain separate | None                             |
 | Hosted ACA Easy Auth               | Platform browser cookie plus verified workload proof and user principal   | Required; frontend-only identity |
 
-Configuration checks and mocked Blob tests do not establish Azure-host storage access. Real nginx/TLS and signed-token tests establish local transport behavior, not Azure token issuance, tenant claim shape, shared-loopback reachability, VPN routing, signed-in browser behavior or deployed revision recovery.
-Hosted release acceptance additionally requires an authorized disposable resource group/VPN, two signed-in user scopes, CSRF writes, native media through refresh, wrong-caller denial, helper outage/recovery, peer/network denial and actual Azure-host Blob Compose reads/writes. Those hosted checks have not yet been completed for this implementation.
+Deployments must satisfy the following acceptance requirements:
+
+| Area                  | Requirement                                                                                        |
+|-----------------------|----------------------------------------------------------------------------------------------------|
+| Runtime compatibility | Local and Compose modes remain independent of hosted caller authentication, including Blob access  |
+| Hosted authentication | Require valid caller proof and a complete user principal; retain internal-only backend ingress     |
+| Browser and media     | Preserve sign-in, user scopes and native media, including HEAD and Range requests                  |
+| Persistence           | Preserve CSRF protection and revision-conditional writes with the configured storage backend       |
+| Token lifecycle       | Refresh proof before its safety cutoff and deny protected forwarding when usable proof is absent   |
+| Rollout and recovery  | Verify the selected revisions and restore an eligible authenticated pair or close frontend ingress |
