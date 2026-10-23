@@ -482,7 +482,7 @@ def test_given_e2e_fixture_and_rename_map_when_dataset_contract_built_then_camer
             {"observation.images.top": {"dtype": "image", "shape": [480, 640, 3]}},
             {},
             {"observation.images.top": [3, 480, 640]},
-            id="canonical-camera-unrenamed",
+            id="canonical-camera-not-renamed",
         ),
     ],
 )
