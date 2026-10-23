@@ -213,6 +213,18 @@ pipeline have no manifest and do not load.
 > The manifest detects corruption and mix-ups. It is not a signature: anyone who can
 > rewrite the checkpoint directory can also rewrite the manifest.
 
+### LeRobot Versions
+
+The VLA training pipeline trains with LeRobot 0.6.1, and the workload environment uses
+LeRobot 0.4.4, which can't parse a 0.6.1 pi05 configuration. The stage refuses every
+pipeline candidate until the `ur10e-single` lock moves to LeRobot 0.6.1.
+
+On 0.6.1, `self-check` runs, but `headless` and `record` still use 0.4.4 APIs and stop
+before they connect to the UR10e. LeRobot 0.6 moved `build_dataset_frame` and
+`hw_to_dataset_features` from `lerobot.datasets.utils` to `lerobot.utils.feature_utils`,
+and `lerobot-record` no longer runs a policy, because 0.6 moved policy deployment to
+`lerobot-rollout`. Until both modes are ported, no checkpoint can drive the arm.
+
 ## 📦 Caching
 
 Nothing in the deployment path pulls from the internet at run time.
@@ -262,6 +274,7 @@ the same way, so `UR10E_CHECKPOINT_PATH` and `HF_HOME` resolve identically on bo
 | `load_failed` reports `No candidate-manifest.json`            | The checkpoint did not come from the VLA training pipeline, or its manifest was not copied in                                    |
 | `load_failed` reports `does not match its candidate manifest` | A file was added, removed, or changed after training; redeploy the candidate and its manifest unchanged                          |
 | `load_failed` reports that the weights did not load           | The weights do not fit the pi05 model in this image, for example after a LeRobot version change                                  |
+| `load_failed` reports `are not valid for PI05Config`          | The image's LeRobot 0.4.4 can't parse a 0.6.1 pipeline candidate; move the `ur10e-single` lock to 0.6.1                          |
 | `CodecLimitsError` on `get_action`                            | The observation exceeds the 8 MiB encoded ceiling; reduce camera count or resolution                                             |
 | `KeyError: 'DISPLAY'` at import                               | Something imported the ur10e-single teleoperator; only `headless` mode stubs `pyautogui`                                         |
 | The arm never moves in `headless` mode                        | `UR10E.active` is still false; homing must complete before servoJ is unlocked                                                    |
