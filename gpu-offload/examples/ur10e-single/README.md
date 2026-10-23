@@ -85,24 +85,29 @@ moves toward that limit.
 ## 🚀 Run
 
 1. Stage a pi05 candidate from the VLA training pipeline on the GPU node, then point the
-   tasks at it and at the tokenizer cache. Download the pipeline's `candidate` and
-   `candidate_manifest` outputs and copy `candidate-manifest.json` into the candidate
-   directory. Keep nothing else there: the GPU stage refuses a directory whose files
-   differ from the manifest.
+   tasks at it and at the tokenizer cache. `az ml job download` writes each output to
+   `<download-path>/named-outputs/<output-name>/`, so the commands below put the candidate
+   in `~/pi05-ur10e/named-outputs/candidate/` and its manifest in
+   `~/pi05-ur10e/named-outputs/candidate_manifest/candidate-manifest.json`. Copy the
+   manifest into the candidate directory and keep nothing else there: the GPU stage
+   refuses a directory whose files differ from the manifest.
 
    ```bash
    az ml job download --name "$AZUREML_JOB_NAME" --output-name candidate \
      --resource-group "$AZURE_RESOURCE_GROUP" --workspace-name "$AZUREML_WORKSPACE_NAME" \
-     --download-path ./pi05-ur10e
+     --download-path ~/pi05-ur10e
    az ml job download --name "$AZUREML_JOB_NAME" --output-name candidate_manifest \
      --resource-group "$AZURE_RESOURCE_GROUP" --workspace-name "$AZUREML_WORKSPACE_NAME" \
-     --download-path ./pi05-ur10e
+     --download-path ~/pi05-ur10e
+   cp ~/pi05-ur10e/named-outputs/candidate_manifest/candidate-manifest.json \
+     ~/pi05-ur10e/named-outputs/candidate/
    cd gpu-offload
    mise run a-env-init
    ```
 
-   Then set `UR10E_MODEL_HOST_PATH` to the candidate directory and
-   `UR10E_HF_CACHE_HOST_PATH` in `.env`.
+   Then set `UR10E_MODEL_HOST_PATH` in `.env` to the absolute path of the candidate
+   directory, such as `/home/<user>/pi05-ur10e/named-outputs/candidate`, not to
+   `~/pi05-ur10e` itself, and set `UR10E_HF_CACHE_HOST_PATH`.
 
 2. Start the host registry once per machine:
 
