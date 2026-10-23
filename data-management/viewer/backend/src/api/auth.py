@@ -14,20 +14,33 @@ resource; credentials are never logged.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import logging
 import os
+import re
 import secrets
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
+
+from .validation import SAFE_CAMERA_NAME_PATTERN, SAFE_DATASET_ID_PATTERN
 
 logger = logging.getLogger(__name__)
 
 AuthMode = Literal["azure_ad", "auth0", "easy_auth", "apikey", "local"]
+MEDIA_COOKIE_NAME = "__Secure-dataviewer-media"
+MEDIA_COOKIE_TTL_SECONDS = 300
+_MEDIA_PATH = re.compile(
+    rf"/api/datasets/{SAFE_DATASET_ID_PATTERN.removeprefix('^').removesuffix('$')}"
+    rf"/episodes/[0-9]+/(?:frames/[0-9]+|video/{SAFE_CAMERA_NAME_PATTERN.removeprefix('^').removesuffix('$')})"
+)
 
 
 class PrincipalContext(BaseModel):
@@ -35,6 +48,12 @@ class PrincipalContext(BaseModel):
 
     scope_id: str
     auth_mode: AuthMode
+
+
+class MediaSession(BaseModel):
+    """Lifetime of the native-media cookie, without exposing credentials."""
+
+    expires_in: int
 
 
 # ============================================================================
@@ -116,9 +135,20 @@ class JwtProvider(AuthProvider):
 
     async def authenticate(self, request: Request) -> dict[str, Any] | None:
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
+        if "Authorization" in request.headers:
+            if not auth_header.startswith("Bearer "):
+                return None
+            token = auth_header[len("Bearer ") :].strip()
+        elif (
+            request.method in {"GET", "HEAD"}
+            and _MEDIA_PATH.fullmatch(request.url.path)
+            and request.headers.get("Sec-Fetch-Site") == "same-origin"
+        ):
+            token = request.cookies.get(MEDIA_COOKIE_NAME, "")
+        else:
             return None
-        token = auth_header[len("Bearer ") :].strip()
+        if not token:
+            return None
         try:
             import jwt  # pyjwt[cryptography]
         except ImportError as exc:
@@ -136,6 +166,7 @@ class JwtProvider(AuthProvider):
                 algorithms=["RS256"],
                 audience=self._audience,
                 issuer=self._issuer,
+                options={"require": ["exp"]},
             )
             payload["auth_method"] = self._auth_method
             return payload
@@ -153,36 +184,62 @@ class JwtProvider(AuthProvider):
 
 
 class EasyAuthProvider(AuthProvider):
-    """Reads identity from Azure Container Apps Easy Auth X-MS-CLIENT-PRINCIPAL header."""
+    """Validate an Easy Auth principal bound to the trusted frontend proxy."""
+
+    def __init__(self, expected_proxy_key: str) -> None:
+        if not expected_proxy_key:
+            raise ValueError("DATAVIEWER_PROXY_KEY is required for easy_auth")
+        try:
+            self._expected_proxy_key = expected_proxy_key.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("DATAVIEWER_PROXY_KEY must contain only ASCII characters") from exc
 
     async def authenticate(self, request: Request) -> dict[str, Any] | None:
+        proxy_key = request.headers.get("X-Dataviewer-Proxy-Key", "")
         principal = request.headers.get("X-MS-CLIENT-PRINCIPAL", "")
-        if not principal:
+        if not proxy_key or not principal:
             return None
-        import base64
-        import json
 
         try:
-            claims_json = json.loads(base64.b64decode(principal))
-        except (ValueError, json.JSONDecodeError):
+            supplied_proxy_key = proxy_key.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+        if not secrets.compare_digest(supplied_proxy_key, self._expected_proxy_key):
             return None
 
-        claims = claims_json.get("claims", [])
-        name_id = ""
+        try:
+            decoded = base64.b64decode(principal, validate=True)
+            principal_document = json.loads(decoded)
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(principal_document, dict):
+            return None
+
+        claims = principal_document.get("claims")
+        if not isinstance(claims, list):
+            return None
+
+        subject = ""
         name = ""
         roles: list[str] = []
         for claim in claims:
-            typ = claim.get("typ", "")
-            val = claim.get("val", "")
-            if "nameidentifier" in typ:
-                name_id = val
-            elif typ == "name":
-                name = val
-            elif typ == "roles":
-                roles.append(val)
+            if not isinstance(claim, dict):
+                return None
+            claim_type = claim.get("typ")
+            claim_value = claim.get("val")
+            if not isinstance(claim_type, str) or not isinstance(claim_value, str):
+                return None
+            if "nameidentifier" in claim_type:
+                subject = claim_value.strip()
+            elif claim_type == "name":
+                name = claim_value
+            elif claim_type == "roles" and claim_value:
+                roles.append(claim_value)
 
+        if not subject:
+            return None
         return {
-            "sub": name_id,
+            "sub": subject,
             "name": name,
             "roles": roles,
             "auth_method": "easy_auth",
@@ -222,10 +279,10 @@ def _build_provider() -> AuthProvider:
         return JwtProvider(jwks_uri=jwks_uri, audience=audience, issuer=issuer, auth_method="auth0")
 
     if provider_name == "easy_auth":
-        return EasyAuthProvider()
+        return EasyAuthProvider(os.environ.get("DATAVIEWER_PROXY_KEY", ""))
 
-    logger.error("Unknown DATAVIEWER_AUTH_PROVIDER value: %s; falling back to API-key", provider_name)
-    return ApiKeyProvider(os.environ.get("DATAVIEWER_API_KEY", ""))
+    logger.error("Unsupported DATAVIEWER_AUTH_PROVIDER value: %s", provider_name)
+    raise ValueError(f"Unsupported DATAVIEWER_AUTH_PROVIDER: {provider_name}")
 
 
 # Module-level singleton; reset in tests via ``reset_auth_provider()``.
@@ -277,6 +334,40 @@ async def require_auth(request: Request) -> dict[str, Any] | None:
         )
 
     return user
+
+
+def issue_media_session(request: Request, response: Response, user: dict[str, Any] | None) -> MediaSession:
+    """Copy an already verified JWT to a short-lived, read-only media cookie."""
+    expiration = user.get("exp") if user is not None else None
+    authorization = request.headers.get("Authorization", "")
+    if (
+        user is None
+        or user.get("auth_method") not in {"azure_ad", "auth0"}
+        or not authorization.startswith("Bearer ")
+        or not isinstance(expiration, int)
+        or isinstance(expiration, bool)
+    ):
+        logger.warning("Media session rejected: a verified expiring JWT is required")
+        raise HTTPException(status_code=401, detail="JWT authentication required for native media")
+    lifetime = min(MEDIA_COOKIE_TTL_SECONDS, expiration - int(time.time()))
+    if lifetime <= 0:
+        logger.warning("Media session rejected: credential has expired")
+        raise HTTPException(status_code=401, detail="Authentication expired")
+    token = authorization[len("Bearer ") :].strip()
+    if len(token.encode("utf-8")) > 3800:
+        logger.warning("Media session rejected: credential exceeds browser cookie capacity")
+        raise HTTPException(status_code=400, detail="Authentication token exceeds native media cookie capacity")
+    response.set_cookie(
+        key=MEDIA_COOKIE_NAME,
+        value=token,
+        max_age=lifetime,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/api/datasets/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return MediaSession(expires_in=lifetime)
 
 
 def resolve_principal_context(user: dict[str, Any] | None) -> PrincipalContext:

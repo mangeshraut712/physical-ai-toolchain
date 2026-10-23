@@ -2,7 +2,7 @@
 title: Dataset Analysis Tool
 description: Run and configure the web application for analyzing and annotating episode-based robotics datasets
 author: Microsoft
-ms.date: 2026-09-23
+ms.date: 2026-10-19
 ms.topic: overview
 ---
 
@@ -23,6 +23,12 @@ A full-stack application for analyzing and annotating robotic training data from
 | Node.js | 24+                    |
 | npm     | Bundled with Node.js   |
 | uv      | Current stable release |
+| ffmpeg  | Current stable release |
+
+The backend container image installs `ffmpeg`. When you run the backend outside it, put `ffmpeg` on `PATH`:
+
+- HDF5 datasets need it, or OpenCV, to stream camera images as video. Without either, their camera video is unavailable.
+- LeRobot datasets play without it, but each episode then loads its camera's whole video file instead of the episode's clip.
 
 ## 📦 Installation
 
@@ -73,6 +79,12 @@ Run the cross-platform development command after the container finishes setup:
 ```bash
 npm run dataviewer:dev
 ```
+
+## 📊 AI Analysis
+
+The [AI-analysis endpoints](backend/src/api/routes/ai_analysis.py) require nonempty, rectangular position and force matrices containing only finite numbers. Invalid matrices return HTTP 400. `POST /api/ai/cluster` requires at least two trajectories; an explicit `num_clusters` must be between 2 and 20 and cannot exceed the number of trajectories.
+
+The [clustering service](backend/src/api/services/clustering.py) applies a shared scale to extreme coordinate magnitudes before extracting features when squared statistics or path lengths risk overflowing float64. Ordinary coordinate magnitudes retain their original feature calculation.
 
 ## 📄 Accepted Dataset Contract
 
@@ -151,7 +163,13 @@ STORAGE_BACKEND=local
 DATA_DIR=/path/to/your/datasets
 ```
 
+The backend lists every dataset folder under `DATA_DIR`, up to five levels deep, and joins nested folder names with `--` in the dataset ID. It skips folders whose names start with `.`, including an export's hidden staging folder.
+
 ### Azure Blob Storage
+
+Dataset sources are exclusive: Azure mode reads only Blob datasets and ignores
+`DATA_DIR`. Missing Azure configuration or dependencies fail explicitly; they do
+not enable local discovery. Local mode reads only `DATA_DIR`.
 
 Use this mode when datasets live in Azure Blob Storage. Authentication uses
 [DefaultAzureCredential](https://learn.microsoft.com/azure/developer/python/sdk/authentication-overview),
@@ -236,92 +254,133 @@ card on the trajectory tab:
 
 #### How to use it
 
-1. Enable the judge and start the viewer with `./start.sh`. It installs the
-  lightweight `physical-ai-vlm-judge` package into the backend environment and
-  adds local model dependencies only when `VLM_JUDGE_BACKEND=qwen3-vl`:
+Choose where inference runs:
+
+| Backend         | Runs the model on              | Viewer needs a GPU?                     |
+|-----------------|--------------------------------|-----------------------------------------|
+| `qwen3-vl`      | The viewer host                | Yes, a suitable CUDA-capable NVIDIA GPU |
+| `openai-compat` | A separate inference server    | No                                      |
+| `echo`          | No model; returns test results | No                                      |
+
+RTX is not required; Azure A10 is also a candidate. For local Qwen3-VL-4B, start
+validation with a full 24 GB GPU and concurrency one. Actual memory use depends on
+the model and frame settings. See [GPU and Azure deployment guidance](../../evaluation/vlm_judge/README.md).
+
+1. Enable the selected backend and start the viewer. For local Qwen:
 
    ```bash
-   VLM_JUDGE_ENABLED=true VLM_JUDGE_BACKEND=qwen3-vl ./start.sh
+   VLM_JUDGE_ENABLED=true VLM_JUDGE_BACKEND=qwen3-vl \
+     VLM_JUDGE_MODEL_REVISION='<reviewed-full-40-hex-commit-sha>' ./start.sh
    ```
 
-2. Open a dataset, select an episode, and switch to the **Trajectory** tab.
-3. Click **Run judge**. The first run invokes the model; results are cached per
-   dataset under `annotations/vlm_judge/`, so re-opening the episode is instant.
-   Use **Re-evaluate** / **Force fresh** to ignore the cache and run again.
+2. Select an episode and save its changes. Resolve any unsaved-input or conflict warnings.
+3. Open Episode Analysis on the Trajectory Viewer tab and run the judge.
+4. Review progress and the saved result. Apply the result separately to update labels.
 
 > [!NOTE]
-> The default `echo` backend returns deterministic placeholder judgments (no model
-> is loaded). It exists to verify the wiring end-to-end and for tests — switch to
-> `qwen3-vl` (local GPU) or `openai-compat` (a remote vLLM/NIM/Azure OpenAI server)
-> for real scores.
+> The launcher restores frozen dependencies; approve restoration and model downloads
+> before first use. The default `echo` backend tests the workflow, not model quality.
+> Reopening saved results does not run inference again. Force a new evaluation only
+> when you intend to recompute.
 
 #### Applying judgments as episode labels
 
-The judge's outcome maps directly onto the viewer's episode label set
-(`SUCCESS` / `FAILURE` / `PARTIAL`), so a judgment can be promoted to a saved label:
+Judging alone does not change labels. Explicit application saves a machine-owned
+contribution linked to the result, while protecting human revisions and unrelated fields.
 
-- **Apply label** writes the current episode's outcome as its label
-  (`SUCCESS` → `SUCCESS`, `FAILURE` → `FAILURE`, `Inconclusive` → `PARTIAL`). It
-  replaces any existing outcome label while preserving other custom labels on the
-  episode, then persists via the labels API.
+| Judge outcome  | Label application        |
+|----------------|--------------------------|
+| `SUCCESS`      | Can apply `SUCCESS`      |
+| `FAILURE`      | Can apply `FAILURE`      |
+| `Inconclusive` | Does not apply `PARTIAL` |
 
 #### Scoring every episode
 
-The **Whole dataset** controls run the judge across all episodes — sequentially,
-one episode at a time, not as a single batched model call. Each episode reuses the
-per-episode endpoint and its cache, so episodes already scored return instantly and
-only those not yet scored invoke the model. A progress indicator shows
-`done / total`, and **Cancel** stops the run after the in-flight episode.
+1. Save any episode-label or instruction edits. Select exactly one `SUCCESS`, `FAILURE` or
+  `PARTIAL` label for each grounding episode; conflicting outcome labels cannot form a label baseline.
+2. Open Dataset workspace and select grounding episodes. Each needs a saved instruction or a
+  dataset task instruction. Saved task-completeness ratings are also supported.
+3. Select the cameras and scoring method, then choose **Evaluate grounding episodes**.
+4. Review the saved-baseline versus judge comparisons. Acknowledge disagreements or inconclusive
+  results, then choose **Approve configuration**. Individual episode judge runs do not create approvals.
+5. Select that entry in **Configuration approval** and choose target episodes. Leave the target
+  field empty to select every episode not used for grounding, then submit judge-only or judge-and-label work.
+6. Follow the saved job's progress. You can close the browser and reconnect later.
 
-- **Run all** scores every episode with the selected scoring technique but writes
-  no labels. It uses each episode's saved instruction, or the instruction from
-  dataset metadata when no saved annotation exists.
-- **Label all** scores every episode and writes each outcome as that episode's
-  label, using the same outcome → label mapping as **Apply label** above.
+| Operation       | Effect                                                                                    |
+|-----------------|-------------------------------------------------------------------------------------------|
+| Judge-only      | Saves results without changing labels                                                     |
+| Judge-and-label | Judges and conditionally applies results                                                  |
+| Cancel          | Prevents late results from publishing; an active GPU call may continue                    |
+| Retry           | Retries eligible failed work through the saved job                                        |
+| Withdraw        | Previews and removes covered machine contributions; preserves human revisions and history |
 
-> [!NOTE]
-> Sequential scoring with a local backend is slow: the model loads on the first
-> episode and each subsequent episode runs a full judgment chain. Prefer a hosted
-> `openai-compat` backend for whole-dataset runs, and leave results cached so reruns
-> skip already-scored episodes.
+Changing the configuration, source or samples invalidates the corresponding approval.
+
+Instruction source is user-selected metadata, not an eligibility restriction. Saved template
+instructions and dataset task instructions are accepted. Episode labels, including AI-applied
+labels, provide baseline outcomes; they do not establish independent human validation. Conflicting
+outcome labels cannot provide a label baseline. No Task Completeness pane is required for label-based
+grounding. The Task Completeness widget is not displayed in the current workspace; use the visible
+Episode Labels controls for label baselines. The approval selector shows **No approved configuration
+yet** until a grounding evaluation is reviewed and approved. Saving labels or annotations refreshes
+eligibility and approval state; unsaved drafts still block new work.
+
+Episode labels, structured annotations and saved judge results are separate records. A SUCCESS
+judge result does not change a label or annotation unless explicitly applied. An applied label can
+be a baseline without being represented as human-authored evidence.
+
+The reset-history read (`GET /api/judge/resets`) returns `200` with `null` when no label removal has
+run. Do not restart a viewer while its job is active.
 
 #### "Run judge" vs. "Language instruction"
 
-The judge scores the episode against a **task instruction** — the natural-language
-goal for the episode, such as *"Grab orange and place into plate"*. **Run judge** uses
-the instruction currently shown in the viewer's **Language Instruction** panel (your
-saved or in-progress edit), so refining that text changes what the judge grades against.
-In short:
+| Action or input      | Meaning                                                                           |
+|----------------------|-----------------------------------------------------------------------------------|
+| Language Instruction | The goal against which the episode is judged; save edits before judging           |
+| Save                 | Persists episode changes and stays on the episode                                 |
+| Next                 | Navigates; it is not a save action                                                |
+| Run judge            | Uses the selected saved instruction and supported saved edits, not browser drafts |
+| Dataset job          | Uses each target's own saved inputs, not the active episode's text                |
 
-- **Language Instruction** = *what the robot was asked to do* (the goal the
-  judge grades against).
-- **Run judge** = *grade this episode against that goal* and report the outcome,
-  progress, milestones, and any failure mode.
-
-When the Language Instruction is left empty, **Run judge** falls back to the task
-instruction stored in the dataset's metadata. If neither is available, it returns an
-error asking you to add or save a Language Instruction.
-
-Whole-dataset actions do not reuse the current unsaved Language Instruction for every
-episode. They score each episode against that episode's saved annotation text, falling
-back to dataset metadata when needed.
+Dataset metadata supplies the instruction when no saved instruction exists. Missing
+or ambiguous inputs block judging. Unsupported media transformations also block
+judging rather than silently substituting the original video.
 
 #### Settings
 
-Enable the judge via `start.sh`, or install the backend `vlm-judge` extra before
-launching the backend manually. Install `vlm-judge-local` when using the
-in-process `qwen3-vl` backend without `start.sh`.
+The launcher selects the evaluator dependencies for the configured backend. For
+container build profiles and Azure setup, see the
+[deployment guide](../../evaluation/vlm_judge/README.md).
 
-| Variable                   | Default                     | Description                                                                           |
-|----------------------------|-----------------------------|---------------------------------------------------------------------------------------|
-| `VLM_JUDGE_ENABLED`        | `false`                     | Mount the `/judge` router                                                             |
-| `VLM_JUDGE_BACKEND`        | `echo`                      | `qwen3-vl` (local HF), `openai-compat` (vLLM, NIM, Azure OpenAI), or `echo`           |
-| `VLM_JUDGE_MODEL_ID`       | `Qwen/Qwen3-VL-4B-Instruct` | HF model id or remote model name                                                      |
-| `VLM_JUDGE_BASE_URL`       | —                           | OpenAI-compatible server URL (`openai-compat` only)                                   |
-| `VLM_JUDGE_API_KEY`        | —                           | Bearer token for the remote backend                                                   |
-| `VLM_JUDGE_N_FRAMES`       | `12`                        | Frames sampled per episode                                                            |
-| `VLM_JUDGE_PROCESS_METHOD` | `gvl`                       | Process-reward method: `gvl` (shuffle-and-rank) or `chronological`                    |
-| `VLM_JUDGE_CACHE_DIR`      | —                           | Fallback judgment cache; the viewer caches per dataset under `annotations/vlm_judge/` |
+| Variable                   | Default                       | Description                                                                             |
+|----------------------------|-------------------------------|-----------------------------------------------------------------------------------------|
+| `VLM_JUDGE_ENABLED`        | `false`                       | Enable the viewer judge and durable `/api/judge` lifecycle routes                       |
+| `VLM_JUDGE_BACKEND`        | `echo`                        | `qwen3-vl` (local HF), `openai-compat` (vLLM, NIM, Azure OpenAI), or `echo`             |
+| `VLM_JUDGE_MODEL_ID`       | `Qwen/Qwen3-VL-4B-Instruct`   | HF model id or remote model name                                                        |
+| `VLM_JUDGE_MODEL_REVISION` | Unset                         | Required full Hub commit SHA for native Qwen; omit for explicit local model directories |
+| `VLM_JUDGE_BASE_URL`       | —                             | OpenAI-compatible server URL (`openai-compat` only)                                     |
+| `VLM_JUDGE_API_KEY`        | —                             | API key for non-Azure endpoints; ignored for Azure endpoints                            |
+| `VLM_JUDGE_N_FRAMES`       | `12`                          | Frames sampled per episode                                                              |
+| `VLM_JUDGE_PROCESS_METHOD` | `gvl`                         | Process-reward method: `gvl` (shuffle-and-rank) or `chronological`                      |
+| `VLM_JUDGE_CACHE_DIR`      | Unset                         | Disposable inference cache, not durable job authority                                   |
+| `VLM_JUDGE_JOB_DIR`        | Derived local default         | Durable local job root; Compose uses `/state/judge`, Azure mode uses shared Blob state  |
+| `VLM_JUDGE_CAPACITY`       | `1`                           | Shared maximum concurrent judgment work for a capacity scope                            |
+| `VLM_JUDGE_CAPACITY_SCOPE` | `configured-inference-device` | Shared identity for workers using the same inference capacity                           |
+
+Configure inference authentication for the target environment, independently of
+Blob storage authentication. The current Azure inference setup is for development;
+production managed-identity support is deferred. See the
+[authentication guidance](../../evaluation/vlm_judge/README.md#azure-inference-authentication).
+
+Native Hub loading requires a full SHA and never enables repository Python code.
+For offline artifacts, set `VLM_JUDGE_MODEL_ID` to an absolute directory or a path
+starting `./` or `../`, and omit `VLM_JUDGE_MODEL_REVISION`. Clear the judgment cache
+after replacing local model contents. Echo and hosted `openai-compat` models need no
+Hub pin. Existing viewer authentication and CSRF remain unchanged; standalone
+`VLM_JUDGE_ALLOW_UNAUTHENTICATED`, `VLM_JUDGE_DATASETS` and `VLM_JUDGE_LOCAL_ACTOR`
+do not govern this router.
+Viewer media must remain inside its dataset directory, including metadata-derived paths.
 
 > [!NOTE]
 > **Process-reward method (`VLM_JUDGE_PROCESS_METHOD`).** The per-frame progress
@@ -342,11 +401,10 @@ in-process `qwen3-vl` backend without `start.sh`.
 
 #### Request timeouts
 
-The `/judge` request stays open until model loading and inference finish. Local
-`qwen3-vl` runs can take minutes on the first request because the backend loads
-the model in-process. Configure any reverse proxy, ingress, or browser-facing
-gateway timeout above the expected first-run latency, or run the model through the
-`openai-compat` shim so the dataviewer backend remains lightweight.
+Submission returns a job acknowledgment; the browser polls for completion. Model
+loading does not hold that browser request open. The worker's inference request still
+needs sufficient server/proxy timeouts. Keep at least one worker replica running while
+jobs are pending; queued jobs cannot wake a scaled-to-zero service.
 
 #### Local model via the openai-compat shim
 
@@ -356,11 +414,16 @@ the bundled OpenAI-compatible shim — and point the dataviewer at it with
 `VLM_JUDGE_BACKEND=openai-compat` and `VLM_JUDGE_BASE_URL=http://127.0.0.1:8001/v1`:
 
 ```bash
-uv run --project ../../evaluation/vlm_judge --extra api --extra qwen3-vl \
+uv run --project ../../evaluation/vlm_judge --frozen --no-sync --extra api --extra qwen3-vl \
   python -m evaluation.vlm_judge.openai_shim \
   --port 8001 \
-  --model-id Qwen/Qwen3-VL-4B-Instruct
+  --model-id Qwen/Qwen3-VL-4B-Instruct \
+  --model-revision '<reviewed-full-40-hex-commit-sha>'
 ```
+
+Run this from the viewer directory after an approved frozen restore of the evaluator's
+`api` and `qwen3-vl` extras. Local Qwen still requires the GPU host and compatible
+runtime; moving inference into a separate process does not remove that requirement.
 
 The shim reads these variables ([`evaluation/vlm_judge/openai_shim.py`](../../evaluation/vlm_judge/openai_shim.py)):
 
@@ -369,6 +432,7 @@ The shim reads these variables ([`evaluation/vlm_judge/openai_shim.py`](../../ev
 | `VLM_SHIM_HOST`                   | `127.0.0.1`                 | Bind address; the shim has no auth, so keep it on loopback            |
 | `VLM_SHIM_PORT`                   | `8001`                      | Listen port                                                           |
 | `VLM_SHIM_MODEL_ID`               | `Qwen/Qwen3-VL-4B-Instruct` | Hugging Face model id to load                                         |
+| `VLM_SHIM_MODEL_REVISION`         | Unset                       | Full Hub commit SHA; omit for an explicit local model directory       |
 | `VLM_SHIM_DEVICE_MAP`             | `auto`                      | Transformers device map                                               |
 | `VLM_SHIM_DTYPE`                  | `bfloat16`                  | Model dtype                                                           |
 | `VLM_SHIM_ALLOW_REMOTE_IMAGES`    | `false`                     | Fetch `http(s)` image URLs server-side; off restricts to `data:` URIs |
@@ -376,55 +440,67 @@ The shim reads these variables ([`evaluation/vlm_judge/openai_shim.py`](../../ev
 
 > [!WARNING]
 > The shim exposes an unauthenticated `/v1/chat/completions` endpoint and runs
-> model inference on untrusted input. Treat it as a trusted-network-only service:
->
-> - Bind to loopback (`VLM_SHIM_HOST=127.0.0.1`, the default). Expose it only on a
->   private, trusted network — never a public interface — and front it with your own
->   auth/proxy if it must be reachable remotely.
-> - Leave `VLM_SHIM_ALLOW_REMOTE_IMAGES=false`. The dataviewer sends frames as
->   `data:` URIs, so it never needs remote fetching. Enabling remote fetch lets the
->   shim issue server-side requests (a server-side request forgery surface) with no
->   host allowlist, so only enable it on a network you fully control.
-> - When remote images are enabled, keep `VLM_SHIM_REMOTE_IMAGE_TIMEOUT_S` low to
->   bound request hangs.
+> model inference on supplied input. Its protocol does not gain the standalone
+> judge router's admission controls. Keep it on loopback on a trusted single-user
+> host with `VLM_SHIM_ALLOW_REMOTE_IMAGES=false`; the viewer sends `data:` URIs.
+> Do not expose it through LAN listeners, proxies, tunnels or port forwarding.
+> Authentication and ingress hardening remain separate work.
 
 ## 🔒 Authentication with Entra ID
 
-The application supports Microsoft Entra ID (Azure AD) authentication for public-facing deployments. When auth is disabled (the default for local development), all requests bypass authentication. When enabled, the frontend uses MSAL.js to acquire tokens via PKCE, and the backend validates JWT tokens against the Entra ID JWKS endpoint.
+Azure Container Apps deployments use Easy Auth on the public frontend. Easy Auth authenticates the browser and injects `X-MS-CLIENT-PRINCIPAL`; the frontend nginx proxy forwards that principal with a Terraform-managed `X-Dataviewer-Proxy-Key`. The backend accepts the principal only when the proxy credential matches, preventing a direct caller from establishing identity by forging the platform header.
+
+The frontend-to-backend proxy preserves native browser requests for images and video, including `HEAD` and HTTP Range requests. The browser does not acquire or attach a separate API token in this deployment mode.
 
 ### Entra ID Prerequisites
 
 1. An [Azure AD app registration](https://learn.microsoft.com/entra/identity-platform/quickstart-register-app) with:
-   - **Single-page application** redirect URI set to your frontend URL (e.g., `http://localhost:5173` for local dev, `https://your-app.azurecontainerapps.io` for production)
-   - An **API scope** named `access_as_user` under "Expose an API" (`api://<client-id>/access_as_user`)
-   - Optional **App roles** defined for role-based access control (e.g., `Dataviewer.Viewer`, `Dataviewer.Annotator`, `Dataviewer.Admin`)
+   - A web redirect URI at `https://<frontend-fqdn>/.auth/login/aad/callback`
+   - A single-page application redirect URI at `http://localhost:5173/redirect.html` for local direct JWT development or `https://<frontend-host>/redirect.html` for production direct JWT deployments
+   - API scope named `access_as_user` under "Expose an API" (`api://<client-id>/access_as_user`) for direct JWT deployments
+   - Optional app roles for role-based access control, such as `Dataviewer.Viewer`, `Dataviewer.Annotator`, and `Dataviewer.Admin`
 
 2. Note the **Application (client) ID** and **Directory (tenant) ID** from the app registration.
 
-### Backend Configuration
+Terraform creates the app registration and enables frontend Easy Auth when authentication is enabled. The deployment script validates the Easy Auth web callback and reconciles the provider without changing redirect URIs.
 
-Set these environment variables in `backend/.env` (or as container environment variables):
+The [Terraform module](../../infrastructure/terraform/modules/dataviewer/variables.tf) defaults to MSAL bridge URIs on local ports 5173 and 5174. Supply `dataviewer_redirect_uris` explicitly for production direct JWT origins or different development ports; caller-supplied lists are used unchanged.
+
+### Azure Container Apps Configuration
+
+Terraform creates one random proxy credential and installs it under the stable `dataviewer-proxy-key` secret name on both Container Apps. The backend bootstrap revision receives the secret reference and enforces proof validation. The public frontend bootstrap revision does not receive the reference; `deploy-dataviewer.sh` adds it only after verifying Easy Auth. The credential is not exposed as a Terraform output.
 
 ```env
 DATAVIEWER_AUTH_DISABLED=false
-DATAVIEWER_AUTH_PROVIDER=azure_ad
+DATAVIEWER_AUTH_PROVIDER=easy_auth
+DATAVIEWER_PROXY_KEY=<shared-random-proxy-key>
 DATAVIEWER_AZURE_TENANT_ID=<your-tenant-id>
 DATAVIEWER_AZURE_CLIENT_ID=<your-client-id>
-DATAVIEWER_SECURE_COOKIES=true   # Set to true when behind HTTPS
+DATAVIEWER_SECURE_COOKIES=true
 ```
 
-The backend validates incoming `Authorization: Bearer <token>` headers using RS256 and the Entra ID JWKS endpoint. When `DATAVIEWER_AUTH_DISABLED=true` (default), all authentication checks are bypassed.
+Do not put the proxy credential in source, command output, Terraform outputs, or deployment logs. [Container Apps secret updates](https://learn.microsoft.com/azure/container-apps/manage-secrets) do not create revisions or update values already loaded by running revisions.
 
-### Frontend Configuration
+Rotate the Terraform-owned password on both apps first, then close frontend ingress, restart both active revisions, verify proof enforcement and anonymous denial, and reopen ingress. Keep ingress closed after any partial restart or failed verification. The [deployment specification](../specifications/viewer-deployment.specification.md#credential-rotation) defines the complete sequence.
 
-The frontend uses build-time environment variables to configure MSAL.js. Set these before building:
+### Other Authentication Modes
+
+The same images support API key, Auth0, and direct Entra JWT deployments. When `DATAVIEWER_PROXY_KEY` is absent, nginx removes any inbound proxy-proof header and preserves the browser's `Authorization` header. Direct Entra JWT deployments can configure the optional MSAL frontend at build time:
 
 ```env
 VITE_AZURE_CLIENT_ID=<your-client-id>
 VITE_AZURE_TENANT_ID=<your-tenant-id>
 ```
 
-When `VITE_AZURE_CLIENT_ID` is set, the app wraps in an `MsalProvider` and attaches Bearer tokens to all API requests. When unset, MSAL is not initialized and the app runs without authentication (suitable for VPN-only access).
+The frontend checks `/.auth/me` before starting MSAL. An active Easy Auth session takes precedence. Otherwise, when `VITE_AZURE_CLIENT_ID` is set, the app uses MSAL and attaches bearer tokens to API fetches for the `azure_ad` backend provider. When unset, MSAL is not initialized. Set `DATAVIEWER_AUTH_DISABLED=true` only for local development or private deployments that intentionally bypass application authentication.
+
+Native images and videos cannot attach authorization headers. [`MediaAuthGate`](frontend/src/components/auth/MediaAuthGate.tsx) obtains a media cookie before mounting the authenticated workspace using the JWT- and CSRF-protected `POST /api/auth/media-session` endpoint. The gate renews at half the returned lifetime and displays an error on failure.
+
+The backend sets a host-only `__Secure-dataviewer-media` cookie with `HttpOnly`, `Secure`, `SameSite=Strict`, and path `/api/datasets/`. Its browser lifetime is at most five minutes and never exceeds the JWT's remaining lifetime. Cookie authentication is restricted to exact read-only frame and video routes, including range requests, and requires `Sec-Fetch-Site: same-origin`. Clients that omit fetch metadata must use a bearer token.
+
+Signature, issuer, audience, and expiration checks still apply; an invalid authorization header never falls back to a cookie. Dataset metadata, annotations, and mutations require ordinary authentication headers. Tokens are never placed in media URLs. Serve the frontend and API on the same HTTPS origin; Easy Auth continues to use its platform session.
+
+Deploy the backend endpoint before the frontend gate. For acceptance, inspect a native `<video>` or `<img>` request with no authorization header, verify playback or image decoding, and confirm cookie-only general API access returns 401.
 
 ### Docker Compose with Auth
 
@@ -435,31 +511,93 @@ export VITE_AZURE_TENANT_ID=<your-tenant-id>
 docker compose up --build
 ```
 
-The frontend Dockerfile passes `VITE_AZURE_CLIENT_ID` and `VITE_AZURE_TENANT_ID` as build arguments. The backend receives `DATAVIEWER_AUTH_DISABLED` as a runtime environment variable.
+This example uses direct Entra JWT validation. Easy Auth is a Container Apps platform feature and is not provided by Docker Compose.
+
+Supply the backend provider, tenant and client variables through container deployment environment settings as well; the Compose file forwards only the auth-disabled switch. Verify the effective environment with `docker compose config` before enabling authentication.
+
+### Redirect Bridge and Deployment
+
+MSAL v5 uses the standalone [redirect bridge](frontend/src/redirect.ts) for interactive redirects and silent iframe responses, independently of cross-origin isolation headers. Vite builds both `index.html` and `redirect.html`; the Docker image copies both documents and their bundled external modules. Token acquisition failures other than interaction-required errors reject API callers rather than sending requests without authentication headers.
+
+The production [NGINX policy](frontend/nginx.conf.template) permits same-origin framing only on `/redirect.html`, with `frame-ancestors 'self'`, `X-Frame-Options: SAMEORIGIN`, and `Cache-Control: no-store`. Root, SPA, static, health and API responses retain framing denial. Keep bridge scripts on the same origin; do not add inline-script allowances or COOP/COEP/CORP headers. Vite development serves the bridge but does not enforce the production NGINX policy.
+
+1. Add each exact `/redirect.html` URI to the Entra SPA registration before deploying an auth-enabled build. Retain the root SPA registration during the rollback window, and keep the Easy Auth web callback unchanged.
+2. Deploy the frontend image with the intended client/tenant build variables, verify the bridge and headers, then complete live authentication acceptance below.
+3. For rollback, restore the previous image and its matching configuration/registration. Do not loosen normal-page framing headers. Remove root SPA entries only after the rollback window closes.
+
+### Authentication Smoke Tests
+
+With an auth-disabled production Compose build running, execute from the repository root:
+
+```bash
+./scripts/security/Test-DataviewerSecurityHeaders.ps1
+npm run test:auth --workspace robotic-training-data-tool
+```
+
+The verifier checks independent policy literals, rejecting weakened or duplicate headers. The browser suite uses the pinned SDK and built bridge without credentials: synthetic `login_required` must reach the caller as `InteractionRequiredAuthError`; blocked framing or a missing bridge must time out. It also checks cross-origin denial and visible, sanitized errors for malformed/missing responses.
+
+These tests prove response delivery, not successful Entra authentication. Direct navigation to `/redirect.html` without an auth response must show an error.
+
+| Runtime                       | Acceptance                                                                                                                                                                                                  |
+|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Auth disabled                 | Build without `VITE_AZURE_CLIENT_ID`, run the backend with `DATAVIEWER_AUTH_DISABLED=true`, and verify normal dataset/API access without login. The bridge still exists for deterministic production tests  |
+| Auth-enabled Vite development | Register the exact origin/port bridge URI, configure both frontend and backend auth, and verify sign-in and authorized API access. Use the production container for framing/header evidence                 |
+| Auth-enabled production       | Register the HTTPS bridge URI, verify proxy headers and bridge asset delivery, then verify real sign-in, API access, silent renewal and the forced iframe fallback under the target tenant/browser policies |
+
+Cached access tokens and successful refresh-token exchanges can bypass the iframe. In a controlled live test, use the pinned SDK's `CacheLookupPolicy.Skip` to force that path and verify its result or interactive recovery; never log codes, tokens or response hashes. Treat tenant consent, browser cookies, issued-token validation and refresh behavior as deployment acceptance, not outcomes of the synthetic suite.
 
 ### Auth Environment Variable Reference
 
-| Variable                     | Location              | Description                                                |
-|------------------------------|-----------------------|------------------------------------------------------------|
-| `DATAVIEWER_AUTH_DISABLED`   | Backend               | Set to `false` to enable auth (`true` disables all checks) |
-| `DATAVIEWER_AUTH_PROVIDER`   | Backend               | Auth provider: `apikey`, `azure_ad`, or `auth0`            |
-| `DATAVIEWER_AZURE_TENANT_ID` | Backend               | Entra ID tenant ID (GUID)                                  |
-| `DATAVIEWER_AZURE_CLIENT_ID` | Backend               | App registration client ID (GUID)                          |
-| `DATAVIEWER_SECURE_COOKIES`  | Backend               | Set to `true` for HTTPS deployments                        |
-| `VITE_AZURE_CLIENT_ID`       | Frontend (build-time) | Same client ID — enables MSAL.js when set                  |
-| `VITE_AZURE_TENANT_ID`       | Frontend (build-time) | Same tenant ID — used for authority URL                    |
+| Variable                     | Location              | Description                                                           |
+|------------------------------|-----------------------|-----------------------------------------------------------------------|
+| `DATAVIEWER_AUTH_DISABLED`   | Backend               | Set to `false` to enable auth (`true` disables all checks)            |
+| `DATAVIEWER_AUTH_PROVIDER`   | Backend               | Auth provider: `apikey`, `azure_ad`, `auth0`, or `easy_auth`          |
+| `DATAVIEWER_PROXY_KEY`       | Frontend and backend  | Shared secret binding Easy Auth principal forwarding to trusted nginx |
+| `DATAVIEWER_AZURE_TENANT_ID` | Backend               | Entra ID tenant ID                                                    |
+| `DATAVIEWER_AZURE_CLIENT_ID` | Backend               | App registration client ID                                            |
+| `DATAVIEWER_SECURE_COOKIES`  | Backend               | Set to `true` for HTTPS deployments                                   |
+| `VITE_AZURE_CLIENT_ID`       | Frontend (build-time) | Enables the optional direct Entra JWT flow when set                   |
+| `VITE_AZURE_TENANT_ID`       | Frontend (build-time) | Tenant used by the optional MSAL authority                            |
 
 ### Token Flow
 
 ```text
-Browser → Entra ID (MSAL.js PKCE) → access_token
-   ↓
-   Bearer token → FastAPI backend (JWT validation)
-   ↓
-   Backend → Azure Storage (Managed Identity, not user token)
+Browser → frontend Easy Auth → authenticated cookie session
+Browser → frontend nginx → native /api, image, and video requests
+Easy Auth principal + proxy credential → FastAPI identity validation
+FastAPI → Azure Storage → managed identity
 ```
 
 The backend accesses Azure Storage using managed identity, not the user's token. User authentication and storage authentication are independent.
+
+### Deployment and Rollback
+
+Run `data-management/setup/deploy-dataviewer.sh` interactively. For authenticated deployments, the script:
+
+1. Verifies both Container Apps already contain the Terraform-owned `dataviewer-proxy-key` secret and the frontend contains the Terraform-owned Easy Auth client credential.
+2. Captures the current images, authentication settings, and secret references and classifies whether they form a secure recovery pair.
+3. Deploys the backend in `easy_auth` mode with its proxy-key secret reference.
+4. Verifies frontend Easy Auth uses the Terraform-owned credential and denies an anonymous forged-principal probe.
+5. Deploys the frontend with its proxy-key secret reference.
+6. Repeats the negative probe, then requires one terminal browser and media verification gate before reporting success.
+
+`--skip-backend` requires an existing backend already using `easy_auth` and `dataviewer-proxy-key`. `--skip-frontend` requires enabled frontend Easy Auth and an existing proxy-key reference. A failed rollout restores only a previously verified secure pair while Easy Auth remains enabled. If no secure pair exists or any restore step fails, the script disables frontend ingress and verifies the deny state. Terraform retains ownership of both credentials throughout deployment and recovery.
+
+### Authentication Smoke Test
+
+Open the deployed frontend in a private browser window and sign in through Easy Auth.
+
+| Probe                                                      | Expected result                        |
+|------------------------------------------------------------|----------------------------------------|
+| `/api/auth/context` through the frontend                   | HTTP 200 with `auth_mode=easy_auth`    |
+| Image and frame requests                                   | Render without a browser bearer header |
+| Video `HEAD` request                                       | Successful native response             |
+| Video Range request                                        | HTTP 206 with the requested byte range |
+| Direct backend request with only a forged principal header | HTTP 401                               |
+| Direct backend request with a missing or wrong proxy key   | HTTP 401                               |
+| Credentialed cross-origin API request                      | Rejected                               |
+
+The backend Container App remains internal-only. Inspect deployment output and application logs after the smoke test to confirm they contain neither the proxy credential nor decoded principal payloads.
 
 ## 🚀 Running the Application
 
@@ -477,7 +615,7 @@ From `data-management/viewer/`:
 npm run dev
 ```
 
-The npm command starts the backend and frontend together on Windows, macOS, and Linux. Stop both processes with `Ctrl+C`.
+The npm command starts the backend and frontend together on Windows, macOS, and Linux. Complete the dependency setup first: npm and VS Code tasks use the prepared backend environment without restoring or removing optional judge packages. Stop both processes with `Ctrl+C`.
 
 ### Health-checked Bash launcher
 
@@ -486,6 +624,8 @@ The npm command starts the backend and frontend together on Windows, macOS, and 
 ```
 
 The Bash launcher starts the backend first, waits for its health endpoint, then starts the frontend. Use it on macOS, Linux, WSL, or a compatible shell when ordered startup and health checking are required.
+
+When a dependency restore is needed, it restores the selected evaluator profile before the backend, then checks the combined environment. A dependency conflict stops startup. Existing services are not reconfigured by changing launcher source.
 
 Available options:
 
@@ -553,6 +693,8 @@ Each episode can carry a structured `LanguageInstructionAnnotation` for vision-l
 
 When a dataset task description is available, the widget seeds the instruction with `source = template` via the "Use as Instruction" button. Otherwise, "Add Instruction" creates a blank instruction with `source = human`. The source can be changed at any time through the dropdown.
 
+A LeRobot export can include the saved instruction as LeRobot `task_aug` and `plan` rows; see [Exporting edited episodes](#exporting-edited-episodes).
+
 ### Episode Analyzer
 
 The **Episode Analyzer** tab combines trajectory metrics, VLM judgments, persisted analysis, episode labels, and language instructions. The run panels and persisted record have distinct storage behavior.
@@ -587,35 +729,95 @@ The label panel shows import buttons only for analysis fields present in the dat
 
 Supported fields include object, pickup location, grasp outcome, place outcome, motion score, motion flags, and source. Free-text movement notes and instructions remain analysis data because importing them would create unbounded label sets.
 
+### Exporting edited episodes
+
+**Export** writes the current episode with its edits applied: removed and inserted frames, crop and resize, trajectory adjustments and subtasks. The source dataset is never modified, and the output path must be under the Dataviewer data directory. A relative output path is resolved against that directory, so the default, `<dataset>-export`, appears in the dataset list as a new dataset beside its source.
+
+| Source format | Export output                                                                                            |
+|---------------|----------------------------------------------------------------------------------------------------------|
+| LeRobot v3.0  | A new LeRobot v3.0 dataset at the output path, which must be new or empty and outside the source dataset |
+| HDF5          | `episode_<index>.hdf5` files in the output directory, with `.meta.json` and `.subtasks.json` beside them |
+
+LeRobot export supports datasets whose camera features are non-depth videos. It refuses a dataset with image features or depth video.
+
+A LeRobot export locks its output directory with a hidden `.dataviewer-export.lock` file and stages the dataset in a hidden `.dataviewer-export.partial` directory inside it, so an existing empty directory, such as a mounted volume, is kept. The dataset appears once the export completes, with `meta` moved in last. While the lock is held, a second export to the same directory fails.
+
+If the backend stops partway through an export, or an export fails and can't remove what it moved, the next export to that directory cleans up first.
+Before moving anything into place, every export records the identity of each file it staged. The cleanup removes the earlier export's staging and the moved files that still match that record, and it keeps a dataset whose move finished. Anything else in the directory stays, including files added inside the earlier export's folders, and exports there fail until you remove it.
+The cleanup opens each folder without following links and checks it against the record, and it ignores a record whose paths don't describe a staged dataset, so it can't remove anything outside the output directory.
+On Windows, which lacks the file operations that make this safe, the next export leaves the earlier export's files in place and fails until you remove them, including the hidden `.dataviewer-export.partial` directory.
+
+LeRobot exports need a filesystem that supports file locking, such as a local disk or a Docker bind mount. On one that doesn't, the export fails and can leave an empty `.dataviewer-export.lock` behind. The export dialog reports every failure as "Export failed", and the backend log gives the reason.
+
+A LeRobot export:
+
+- keeps every supported recorded feature;
+- re-encodes the videos with the source's recorded encoder settings, falling back to LeRobot's defaults for any setting the source doesn't record;
+- recomputes the per-episode and dataset statistics;
+- writes `meta/info.json` for its own files, without the `total_chunks` and `total_videos` counts a LeRobot v2.1 conversion can leave behind;
+- writes subtasks as LeRobot `subtask` annotations;
+- can add saved language instructions as LeRobot `task_aug` and `plan` annotations.
+
+Removing or inserting frames renumbers `frame_index` and sets `timestamp` to `frame_index / fps`. `dataviewer-export.json` maps each output frame to its source frame and records the edits and remapped subtasks.
+
+A subtask that loses its first or last frames to the edits shrinks to the frames that remain, and one with no frames left is dropped.
+
+In a LeRobot export, each subtask becomes a row in the `language_persistent` column, with the subtask label as its text and its first frame's `timestamp`. LeRobot treats a subtask as active until the next one starts, so frames in a gap between two subtasks read as the earlier subtask; `dataviewer-export.json` keeps the exact ranges. The label becomes the annotation text, so name subtasks the way training should read them.
+
+Opening an exported dataset shows its subtasks in the subtask editor. LeRobot subtask rows run until the next one starts, as LeRobot reads them, and an HDF5 export's `.subtasks.json` keeps its exact ranges. When you export again, subtasks you left unchanged keep their recorded data, changed subtasks replace the recorded ones, and deleting every subtask removes them.
+In `dataviewer-export.json`, `subtasks` is `null` when the export kept the recorded subtasks and an empty list when it removed them. A saved draft of the episode takes precedence over the recorded subtasks.
+
+When the source already has LeRobot language annotations, the export keeps them and moves them with the edited frames, apart from rows your subtasks or language instructions replace. Clear **Include subtasks as LeRobot subtask annotations** to export without your subtask changes; recorded subtask rows stay.
+For an HDF5 source the same option reads **Include subtask metadata**, and clearing it still carries a recorded `.subtasks.json` forward to the export.
+A LeRobot export has language columns when its source has them or when an exported episode gets subtask or language-instruction rows, so clearing the subtask option alone doesn't leave them out.
+Both columns use the Arrow types LeRobot declares for them, with tool calls stored as JSON text.
+
+For a LeRobot source, **Include language instructions as LeRobot task phrasings and plan** adds each episode's most recently saved [language instruction](#language-instruction-vla-annotation):
+
+- the instruction and its paraphrases become `task_aug` rows, which LeRobot rotates `${task}` through during training;
+- the subtask instructions become one numbered `plan` row at the first frame.
+
+These rows replace the source's `task_aug` and `plan` rows for that episode, and episodes without a saved instruction keep theirs. The option is on by default in the dialog and in the export API, where `"includeLanguageInstructions": false` turns it off. `dataviewer-export.json` records whose instruction was used and when it was saved.
+
+The trajectory editor adjusts the recorded frame under the playhead. After you remove or insert frames, it says which recorded frame that is. An inserted frame takes its values from the recorded frames on either side, so the editor doesn't adjust it directly.
+
+Trajectory adjustments never replace recorded joint positions:
+
+- LeRobot exports add `adjusted.observation.state` and `adjusted.observation.state_mask` beside `observation.state`. The `adjusted.` prefix keeps them out of LeRobot policy inputs.
+- HDF5 exports add `data/qpos_adjusted` and `data/qpos_adjusted_mask` beside `data/qpos`.
+
+Each export is its own dataset. LeRobot merges datasets only when their features match, so a cropped or adjusted export doesn't merge with an unedited one.
+
 ### VLM dataset-labeling CLI
 
-`backend/scripts/vlm_label_dataset.py` runs Qwen3-VL across a LeRobot v2.1 or v3.0 dataset. It writes full rows to `labels.jsonl` and a flat summary to `labels.csv`.
+`physical_ai_curation.label_dataset` runs Qwen3-VL across a LeRobot v2.1 or v3.0 dataset. It persists jobs before execution and exports full rows to `labels.jsonl` and a flat summary to `labels.csv`.
 
 ```bash
 cd data-management/viewer/backend
-uv run --extra vlm-judge --with-editable ../../../evaluation/vlm_judge \
-  python scripts/vlm_label_dataset.py \
+uv run --frozen --extra vlm-judge \
+  python -m physical_ai_curation.label_dataset \
   --dataset-root /data/my-dataset \
   --dataset-id owner--my-dataset \
   --output-dir /data/my-dataset/vlm-labels \
-  --n-frames 16 \
-  --resume \
-  --write-analysis
+  --model-revision '<reviewed-full-40-hex-commit-sha>' \
+  --n-frames 16 --limit 1 --single
 ```
 
-| Option             | Behavior                                                                                                                             |
-|--------------------|--------------------------------------------------------------------------------------------------------------------------------------|
-| `--dataset-id`     | Writes the canonical dataviewer ID into generated metadata; set it for nested IDs such as `owner--dataset`                           |
-| `--resume`         | Loads existing `labels.jsonl`, skips successful episode indices, retries failed rows, appends attempts, and regenerates `labels.csv` |
-| `--write-analysis` | Merges successful rows into `<dataset-root>/meta/episode_labels.json` without replacing labels or unrelated analysis fields          |
-| `--views`          | Restricts the model input to selected video feature keys; all detected video views are used by default                               |
-| `--limit`          | Processes only the first requested number of episodes                                                                                |
-| `--scene-context`  | Adds dataset-specific scene context to the model prompt                                                                              |
+| Option                 | Behavior                                                                                                   |
+|------------------------|------------------------------------------------------------------------------------------------------------|
+| `--dataset-id`         | Writes the canonical dataviewer ID into generated metadata; set it for nested IDs such as `owner--dataset` |
+| `--resume --job-id ID` | Retries eligible targets in a saved job, preserving successful targets and revalidating saved inputs       |
+| `--write-analysis`     | Requests approved dataset application without replacing human-owned labels or analysis                     |
+| `--views`              | Restricts the model input to selected video feature keys; all detected video views are used by default     |
+| `--limit`              | Processes only the first requested number of episodes                                                      |
+| `--scene-context`      | Adds dataset-specific scene context to the model prompt                                                    |
 
 Without `--write-analysis`, the JSONL and CSV files remain standalone exports and do not appear in the Episode Analysis card. Error rows remain in JSONL and CSV for inspection but are not merged into the dataset analysis map.
 
-> [!WARNING]
-> Stop other writers for the same dataset before using `--write-analysis`. The command replaces the metadata file atomically, but concurrent read-modify-write operations can still overwrite each other.
+Dataset runs require reviewed samples and an approval for the same runtime configuration.
+Use `--operation apply --job-id ID` for explicit application of an eligible saved job.
+Application uses revision-conditional writes; resolve a reported conflict and retry instead of overwriting current metadata.
+Management operations do not require the evaluator package. Direct inference remains available through `evaluation.vlm_judge.run`, without saved-input selection or durable lifecycle options.
 
 ## 🚢 Container Deployment
 
@@ -647,12 +849,12 @@ docker compose up --build
 
 Local storage requires write access to `DATAVIEWER_HOST_DATA_DIR` because annotations and labels are persisted atomically under each dataset directory. The backend validates create, flush, replace, and delete operations during startup and exits with the effective UID and GID when the mount is not writable.
 
-| Environment | Runtime identity |
-|-------------|------------------|
-| Docker Desktop for macOS or Windows | Uses the image-defined UID/GID 999 |
-| Rootful Docker Engine on Linux or directly inside WSL | Set `DATAVIEWER_UID` and `DATAVIEWER_GID` from `id -u` and `id -g` |
-| Rootless Docker | Set `DATAVIEWER_UID=0` and `DATAVIEWER_GID=0`; rootless UID 0 maps to the invoking host user |
-| Docker daemon with user-namespace remapping | Pre-arrange host directory ownership for the daemon's subordinate UID/GID mapping |
+| Environment                                           | Runtime identity                                                                             |
+|-------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| Docker Desktop for macOS or Windows                   | Uses the image-defined UID/GID 999                                                           |
+| Rootful Docker Engine on Linux or directly inside WSL | Set `DATAVIEWER_UID` and `DATAVIEWER_GID` from `id -u` and `id -g`                           |
+| Rootless Docker                                       | Set `DATAVIEWER_UID=0` and `DATAVIEWER_GID=0`; rootless UID 0 maps to the invoking host user |
+| Docker daemon with user-namespace remapping           | Pre-arrange host directory ownership for the daemon's subordinate UID/GID mapping            |
 
 > [!WARNING]
 > Do not use the rootless UID/GID 0 override with a rootful Docker daemon. It runs the backend as host-capable container root.
@@ -690,6 +892,12 @@ Rollback by restoring the previous read-only model directory and its matching `D
 docker compose up -d --force-recreate backend
 ```
 
+### Local K3s Workstation
+
+The [local OSMO profile](../../infrastructure/local/README.md#-dataviewer) deploys the dataviewer into a single-node K3s cluster with `infrastructure/local/04-deploy-dataviewer.sh`. It builds both images into the workstation's loopback registry, runs the backend on the local datasets directory as that directory's owner with `DATAVIEWER_AUTH_DISABLED=true`, and exposes only ClusterIP Services.
+
+Open it through `kubectl proxy`, `kubectl port-forward`, or the pinned ClusterIP. The frontend resolves its assets and API calls against the page's own URL, so it also works under the `kubectl proxy` service path.
+
 ### Azure Kubernetes Service (AKS) / Container Apps
 
 For AKS with workload identity or Container Apps with managed identity, set:
@@ -721,13 +929,19 @@ Mount the reviewed model directory read-only at `/models`. Update the mount and 
 
 ### Building Images
 
+The backend image includes the frozen `azure`, `analysis`, `export`, `auth`, and `yolo` extras. Its build stage installs dependencies; the runtime stage copies the virtual environment with the application user's ownership. Installation caches remain in the build stage.
+
+Build from the repository root so the allowlisted context includes curation, dataset-I/O and evaluator sources.
+
 ```bash
 # Backend
-docker build --file data-management/viewer/backend/Dockerfile --tag dataviewer-backend data-management/viewer/backend
+docker build --file data-management/viewer/backend/Dockerfile --tag dataviewer-backend .
 
 # Frontend
 docker build --file data-management/viewer/frontend/Dockerfile --tag dataviewer-frontend .
 ```
+
+For model-free echo execution, set `--build-arg BACKEND_EXTRAS=azure,analysis,export,auth` to omit YOLO dependencies. Add `--build-arg JUDGE_EXTRAS=openai` for a remote inference client, or `JUDGE_EXTRAS=qwen3-vl` for a separately validated local GPU runtime. Build profiles select installed dependencies; runtime settings still control whether judging is enabled and which backend it uses.
 
 ## 🧪 Development
 
@@ -767,6 +981,15 @@ npm run format       # Prettier check
 npm run format:fix   # Prettier auto-fix
 npm run build        # Production build
 ```
+
+## 🔍 Troubleshooting
+
+Error messages in the viewer leave out server details; the backend log has them.
+
+| Symptom                                                                                      | Cause and fix                                                                                                                                                                                                                                                   |
+|----------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| "Error loading episode: The episode's files couldn't be read; the backend log has the cause" | The dataset's loader couldn't read the episode's files, and the episode, detection, auto-analysis and export-preview endpoints return HTTP 500 with code `EPISODE_LOAD_FAILED`. Find the file and error in the backend log, then repair or replace the episode. |
+| An export reports "Export failed"                                                            | The backend log names the cause. Another export may be writing to the same directory, the output directory may not be new or empty, or its filesystem may not support file locking.                                                                             |
 
 ## 📖 API Documentation
 

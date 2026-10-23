@@ -11,6 +11,11 @@ calibration workload to a fingerprint of that uploaded code. The test records
 the current ``HEAD`` as ``code_revision`` and requires a clean ``training/``
 tree so the declared revision describes the uploaded code.
 
+The calibration trials and the training step request the instance type in
+``E2E_AML_INSTANCE_TYPE_VLA`` or ``E2E_AML_INSTANCE_TYPE``, read from ``.env.local``
+before the environment, or the job files' ``gpu-high-memory`` default. SmolVLA
+needs no Hugging Face token.
+
 ```shell
 uv run pytest -o addopts='' -vv -s -m e2e tests/e2e/test_e2e_aml_vla_training.py
 ```
@@ -27,10 +32,14 @@ from typing import Any
 import pytest
 
 from tests.e2e._aml import (
+    VLA_CALIBRATION_SWEEP_JOB,
+    VLA_TRAINING_PIPELINE_JOB,
+    AzureMLCompute,
     AzureMLJob,
     AzureMLWorkspace,
     cancel_aml_job,
     download_aml_job_output,
+    require_gpu_instance_type,
     resolve_aml_sweep_best_child,
     submit_aml_vla_calibration_sweep,
     submit_aml_vla_pipeline,
@@ -70,10 +79,13 @@ def _load_output_json(job: AzureMLJob, repo_root: Path, output_name: str, filena
 def test_aml_vla_calibrated_training_e2e(
     request: pytest.FixtureRequest,
     aml_workspace: AzureMLWorkspace,
-    aml_compute_target: str,
+    aml_compute_target: AzureMLCompute,
     repo_root: Path,
     tmp_path: Path,
 ) -> None:
+    instance_type = require_gpu_instance_type(
+        aml_compute_target, repo_root, category="vla", scripts=(VLA_CALIBRATION_SWEEP_JOB, VLA_TRAINING_PIPELINE_JOB)
+    )
     dataset_asset = register_synthetic_lerobot_data_asset(request, repo_root, aml_workspace)
     pipeline_path = repo_root / "training/vla/workflows/azureml/vla-training-pipeline.yaml"
     vla_inputs = {
@@ -104,9 +116,10 @@ def test_aml_vla_calibrated_training_e2e(
     sweep_job = submit_aml_vla_calibration_sweep(
         repo_root,
         aml_workspace,
-        compute_target=aml_compute_target,
+        compute_target=aml_compute_target.name,
         vla_inputs=vla_inputs,
         headroom_fraction=0.1,
+        instance_type=instance_type,
     )
     jobs.append(sweep_job)
     wait_until_aml_started(sweep_job, repo_root, timeout_minutes=15, poll_interval_seconds=30)
@@ -116,11 +129,12 @@ def test_aml_vla_calibrated_training_e2e(
     training_job = submit_aml_vla_pipeline(
         repo_root,
         aml_workspace,
-        compute_target=aml_compute_target,
+        compute_target=aml_compute_target.name,
         vla_inputs=vla_inputs,
         calibration_trial=calibration_trial,
         pipeline_contract_fingerprint=hashlib.sha256(pipeline_path.read_bytes()).hexdigest(),
         training_steps=2,
+        instance_type=instance_type,
     )
     jobs.append(training_job)
     wait_until_aml_started(training_job, repo_root, timeout_minutes=15, poll_interval_seconds=30)
