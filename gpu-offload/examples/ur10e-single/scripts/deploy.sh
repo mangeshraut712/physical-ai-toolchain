@@ -24,7 +24,13 @@ test -f "$model_path/config.json" || {
   exit 1
 }
 test -f "$model_path/model.safetensors" || {
-  echo "No model.safetensors at $model_path; join split weights with: cat $model_path/model.safetensors.part.* > $model_path/model.safetensors" >&2
+  echo "No model.safetensors at $model_path; if the weights were split for transfer, join the parts into model.safetensors and remove the part files" >&2
+  exit 1
+}
+# The GPU stage refuses to load weights that do not match the training candidate's
+# manifest; checking for it here fails before the chart is installed.
+test -f "$model_path/candidate-manifest.json" || {
+  echo "No candidate-manifest.json at $model_path; deploy a VLA training candidate with its manifest copied beside the weights" >&2
   exit 1
 }
 test -d "$cache_path" || {
