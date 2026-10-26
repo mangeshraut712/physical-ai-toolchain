@@ -23,7 +23,7 @@ dependencies = [
     "marshmallow==3.26.2",
     # starlette pulled transitively by mlflow-skinny; mirror the training/rl
     # security pin (GHSA-wqp7-x3pw-xc5r, GHSA-x746-7m8f-x49c, GHSA-82w8-qh3p-5jfq).
-    "starlette==1.8.0",
+    "starlette==1.9.0",
 ]
 
 [tool.uv]
@@ -40,6 +40,6 @@ override-dependencies = [
     # azureml-mlflow caps cryptography below 49.0.0; 48.0.1 is the security
     # floor for GHSA-537c-gmf6-5ccf.
     "cryptography==50.0.2",
-    "starlette==1.8.0",
+    "starlette==1.9.0",
 ]
 package = false
