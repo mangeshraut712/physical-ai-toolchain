@@ -249,6 +249,8 @@ def test_dependency_installation_is_isolated_from_runtime_layers() -> None:
     assert "/root/.cache" not in runtime
     assert "COPY --chown=appuser:appuser data-management/viewer/backend/logging.json ./" in runtime
     assert "USER appuser" in runtime
+    assert "MALLOC_ARENA_MAX=1" in runtime
+    assert "MALLOC_ARENA_MAX" not in base + build
 
 
 def test_judge_profiles_install_from_root_lock_without_checkout_imports() -> None:
