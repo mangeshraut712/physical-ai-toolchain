@@ -14,7 +14,7 @@ dependencies = [
     "python-dotenv==1.2.4",
     "slowapi==0.1.10",
     "aiofiles==25.1.0",
-    "numpy==2.5.3",
+    "numpy==2.5.4",
     "pyarrow==25.0.1",
     "Pillow==13.0.0",
     "av==18.1.0",
@@ -57,12 +57,12 @@ vlm-judge = [
 [dependency-groups]
 dev = [
     "physical-ai-vlm-judge[openai]==0.1.0",
-    "ruff==0.16.10",
+    "ruff==0.17.1",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
     "httpx==0.28.1",
-    "hypothesis==6.168.5",
+    "hypothesis==6.170.2",
     "schemathesis==4.29.4",
 ]
 
